@@ -456,7 +456,9 @@ pub mod instances {
             "java_path_auto_detect" => Some(java_path_auto_detect()),
             "java_resolving" => Some(java_resolving()),
             "java_section" => Some(java_section()),
-            "jvm_flags_default" => Some(jvm_flags_default()),
+            "jvm_gc_opts_none" => Some(jvm_gc_opts_none()),
+            "jvm_gc_opts_title" => Some(jvm_gc_opts_title()),
+            "jvm_opts" => Some(jvm_opts()),
             "kill" => Some(kill()),
             "launch_after_install" => Some(launch_after_install()),
             "launch_blocked" => Some(launch_blocked()),
@@ -477,9 +479,9 @@ pub mod instances {
             "remove" => Some(remove()),
             "resync" => Some(resync()),
             "runtime" => Some(runtime()),
-            "set_flags" => Some(set_flags()),
             "set_java_path" => Some(set_java_path()),
             "set_memory" => Some(set_memory()),
+            "set_opts" => Some(set_opts()),
             "status" => Some(status()),
             "status_available" => Some(status_available()),
             "status_failed" => Some(status_failed()),
@@ -615,16 +617,28 @@ pub mod instances {
             _ => "Java",
         }
     }
-    pub fn jvm_flags(flags: String) -> String {
+    pub fn jvm_gc_opts_default(gc: String) -> String {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => format!("Флаги JVM: {flags}"),
-            _ => format!("JVM flags: {flags}"),
+            1 => format!("По умолчанию ({gc})"),
+            _ => format!("Default ({gc})"),
         }
     }
-    pub fn jvm_flags_default() -> &'static str {
+    pub fn jvm_gc_opts_none() -> &'static str {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => "по умолчанию",
-            _ => "default",
+            1 => "Нет",
+            _ => "None",
+        }
+    }
+    pub fn jvm_gc_opts_title() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Пресет опций GC",
+            _ => "GC options preset",
+        }
+    }
+    pub fn jvm_opts() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Дополнительные опции JVM",
+            _ => "Additional JVM options",
         }
     }
     pub fn kill() -> &'static str {
@@ -757,12 +771,6 @@ pub mod instances {
             _ => "Runtime",
         }
     }
-    pub fn set_flags() -> &'static str {
-        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => "Задать флаги",
-            _ => "Set Flags",
-        }
-    }
     pub fn set_java_path() -> &'static str {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
             1 => "Задать путь",
@@ -773,6 +781,12 @@ pub mod instances {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
             1 => "Задать память",
             _ => "Set Memory",
+        }
+    }
+    pub fn set_opts() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Сохранить",
+            _ => "Save",
         }
     }
     pub fn status() -> &'static str {
@@ -1013,6 +1027,8 @@ pub mod notifications {
             "accounts_reset_from_corruption" => Some(accounts_reset_from_corruption()),
             "already_launching_or_running" => Some(already_launching_or_running()),
             "authentication_cancelled" => Some(authentication_cancelled()),
+            "data_from_newer_launcher" => Some(data_from_newer_launcher()),
+            "delete_all_data_busy" => Some(delete_all_data_busy()),
             "enter_offline_nickname" => Some(enter_offline_nickname()),
             "install_already_running" => Some(install_already_running()),
             "instance_not_installed_locally" => Some(instance_not_installed_locally()),
@@ -1060,6 +1076,18 @@ pub mod notifications {
             _ => format!("Authentication failed: {error}"),
         }
     }
+    pub fn data_from_newer_launcher() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Данные лаунчера от более новой версии, обновите лаунчер",
+            _ => "Launcher data is from a newer version, update the launcher",
+        }
+    }
+    pub fn delete_all_data_busy() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Остановите запущенные игры и установки перед удалением данных лаунчера.",
+            _ => "Stop running games and installs before deleting launcher data.",
+        }
+    }
     pub fn enter_offline_nickname() -> &'static str {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
             1 => "Введите офлайн-ник в настройках инстанса",
@@ -1070,6 +1098,12 @@ pub mod notifications {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
             1 => format!("Не удалось добавить URL бэкенда: {error}"),
             _ => format!("Failed to add backend URL: {error}"),
+        }
+    }
+    pub fn failed_delete_all_data(error: String) -> String {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => format!("Не удалось удалить данные лаунчера: {error}"),
+            _ => format!("Failed to delete launcher data: {error}"),
         }
     }
     pub fn failed_delete_instance(error: String) -> String {
@@ -1132,10 +1166,10 @@ pub mod notifications {
             _ => format!("Failed to save Java path: {error}"),
         }
     }
-    pub fn failed_save_jvm_flags(error: String) -> String {
+    pub fn failed_save_jvm_opts(error: String) -> String {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => format!("Не удалось сохранить флаги JVM: {error}"),
-            _ => format!("Failed to save JVM flags: {error}"),
+            1 => format!("Не удалось сохранить опции JVM: {error}"),
+            _ => format!("Failed to save JVM options: {error}"),
         }
     }
     pub fn failed_save_launcher_settings(error: String) -> String {
@@ -1339,7 +1373,7 @@ pub mod placeholders {
             "client_id" => Some(client_id()),
             "client_secret" => Some(client_secret()),
             "instance_name" => Some(instance_name()),
-            "jvm_flags" => Some(jvm_flags()),
+            "jvm_opts" => Some(jvm_opts()),
             "launcher_name" => Some(launcher_name()),
             "loader_version" => Some(loader_version()),
             "manifest_url" => Some(manifest_url()),
@@ -1368,10 +1402,10 @@ pub mod placeholders {
             _ => "My Instance",
         }
     }
-    pub fn jvm_flags() -> &'static str {
+    pub fn jvm_opts() -> &'static str {
         match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => "Дополнительные флаги JVM",
-            _ => "Extra JVM flags",
+            1 => "Дополнительные опции JVM",
+            _ => "Extra JVM options",
         }
     }
     pub fn launcher_name() -> &'static str {
@@ -1600,6 +1634,10 @@ pub mod providers {
 pub mod settings {
     pub fn get(key: &str) -> Option<&'static str> {
         match key {
+            "delete_all_data" => Some(delete_all_data()),
+            "delete_all_data_confirm" => Some(delete_all_data_confirm()),
+            "delete_all_data_desc" => Some(delete_all_data_desc()),
+            "delete_all_data_title" => Some(delete_all_data_title()),
             "hide_after_launch_desc" => Some(hide_after_launch_desc()),
             "hide_after_launch_title" => Some(hide_after_launch_title()),
             "hide_usernames_desc" => Some(hide_usernames_desc()),
@@ -1610,6 +1648,34 @@ pub mod settings {
             "language_title" => Some(language_title()),
             "title" => Some(title()),
             _ => None,
+        }
+    }
+    pub fn delete_all_data() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Удалить",
+            _ => "Delete",
+        }
+    }
+    pub fn delete_all_data_confirm() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Нажмите ещё раз, чтобы удалить всё",
+            _ => "Click again to delete everything",
+        }
+    }
+    pub fn delete_all_data_desc() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => {
+                "Удаляет все инстансы, аккаунты, Java, кэш и настройки, затем перезапускает лаунчер."
+            }
+            _ => {
+                "Removes all instances, accounts, Java runtimes, caches and settings, then restarts the launcher."
+            }
+        }
+    }
+    pub fn delete_all_data_title() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Удалить все данные лаунчера",
+            _ => "Delete all launcher data",
         }
     }
     pub fn hide_after_launch_desc() -> &'static str {
@@ -1670,6 +1736,8 @@ pub mod settings {
 pub mod update {
     pub fn get(key: &str) -> Option<&'static str> {
         match key {
+            "available_flatpak" => Some(available_flatpak()),
+            "available_nix" => Some(available_nix()),
             "checking" => Some(checking()),
             "downloading" => Some(downloading()),
             "error_offline" => Some(error_offline()),
@@ -1678,6 +1746,18 @@ pub mod update {
             "replacing" => Some(replacing()),
             "up_to_date" => Some(up_to_date()),
             _ => None,
+        }
+    }
+    pub fn available_flatpak() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Доступна новая версия лаунчера. Обновите её командой \"flatpak update\".",
+            _ => "A new launcher version is available. Update it with \"flatpak update\".",
+        }
+    }
+    pub fn available_nix() -> &'static str {
+        match crate::LANG.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "Доступна новая версия лаунчера. Обновите её через Nix.",
+            _ => "A new launcher version is available. Update it through Nix.",
         }
     }
     pub fn checking() -> &'static str {

@@ -1,3 +1,4 @@
+use globset::{Glob, GlobMatcher};
 use instance::{
     authlib::default_authlib_injector_library,
     instance_metadata::{
@@ -83,7 +84,7 @@ async fn get_directory_objects(
     ignore_paths: &HashSet<PathBuf>,
 ) -> Result<Vec<Object>, GetObjectsError> {
     let full_path = path.to_path(base_path);
-    let files = files::get_files_ignore_paths(&full_path, ignore_paths);
+    let files = files::get_files_ignore_paths(&full_path, ignore_paths).await;
     let hashes = files::hash_files(&files, progress::no_progress_bar()).await?;
 
     let mut objects = Vec::with_capacity(files.len());
@@ -104,7 +105,7 @@ async fn get_directory_objects(
     Ok(objects)
 }
 
-fn validate_mod_sync_overrides(
+pub fn validate_mod_sync_overrides(
     mod_entries: &[ModEntry],
     mod_sync: &ModSyncSettings,
 ) -> Result<(), GenerateError> {
@@ -154,6 +155,7 @@ async fn collect_mod_entries(
     base_url: &BaseUrl,
     instance_dir: &InstanceDir,
     mod_sync: &ModSyncSettings,
+    os_specific_mods: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<ModEntry>, GenerateError> {
     let mods_dir_rel = RelativePathBuf::from(ModsDir::name());
     let mods_dir = mods_dir_rel.to_path(source_dir);
@@ -166,6 +168,7 @@ async fn collect_mod_entries(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let os_filters = compile_os_filters(os_specific_mods)?;
 
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&mods_dir).map_err(GetObjectsError::Io)? {
@@ -173,7 +176,7 @@ async fn collect_mod_entries(
         if path.extension().and_then(|ext| ext.to_str()) != Some("jar") {
             continue;
         }
-        let mod_id = match utils::mod_id::extract_mod_id(&path) {
+        let mod_id = match utils::mod_id::extract_mod_id(&path).await {
             Ok(Some(mod_id)) => mod_id,
             Ok(None) => {
                 warn!("Skipping {}, failed to extract mod id", path.display());
@@ -198,13 +201,73 @@ async fn collect_mod_entries(
                     "missing file name".to_string(),
                 )
             })?;
+        let os = match_os_filters(&os_filters, file_name)?;
         let rel_path = RelativePathBuf::from(format!("{}/{file_name}", ModsDir::name()));
         let object = get_file_object(source_dir, &rel_path, base_url, instance_dir).await?;
-        entries.push(ModEntry { mod_id, object });
+        entries.push(ModEntry { mod_id, object, os });
     }
 
     entries.sort_by(|left, right| left.mod_id.cmp(&right.mod_id));
+    validate_duplicate_mod_ids(&entries)?;
     Ok(entries)
+}
+
+const KNOWN_OS_NAMES: [&str; 3] = ["windows", "osx", "linux"];
+
+fn compile_os_filters(
+    os_specific_mods: &HashMap<String, Vec<String>>,
+) -> Result<Vec<(GlobMatcher, Vec<String>)>, GenerateError> {
+    os_specific_mods
+        .iter()
+        .map(|(pattern, os)| {
+            if let Some(unknown) = os.iter().find(|os| !KNOWN_OS_NAMES.contains(&os.as_str())) {
+                return Err(GenerateError::UnknownOs(unknown.clone()));
+            }
+            let matcher = Glob::new(pattern)
+                .map_err(|err| GenerateError::InvalidModGlob(pattern.clone(), err.to_string()))?
+                .compile_matcher();
+            let mut os = os.clone();
+            os.sort();
+            os.dedup();
+            Ok((matcher, os))
+        })
+        .collect()
+}
+
+fn match_os_filters(
+    filters: &[(GlobMatcher, Vec<String>)],
+    file_name: &str,
+) -> Result<Vec<String>, GenerateError> {
+    let mut matched: Option<&Vec<String>> = None;
+    for (matcher, os) in filters {
+        if !matcher.is_match(file_name) {
+            continue;
+        }
+        match matched {
+            Some(previous) if previous != os => {
+                return Err(GenerateError::ConflictingModOs(file_name.to_string()));
+            }
+            _ => matched = Some(os),
+        }
+    }
+    Ok(matched.cloned().unwrap_or_default())
+}
+
+pub fn validate_duplicate_mod_ids(entries: &[ModEntry]) -> Result<(), GenerateError> {
+    for (index, entry) in entries.iter().enumerate() {
+        for other in &entries[index + 1..] {
+            if other.mod_id != entry.mod_id {
+                continue;
+            }
+            let overlaps = entry.os.is_empty()
+                || other.os.is_empty()
+                || entry.os.iter().any(|os| other.os.contains(os));
+            if overlaps {
+                return Err(GenerateError::DuplicateModId(entry.mod_id.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -378,6 +441,9 @@ pub struct InstanceSpec {
     pub content_rules: Vec<ContentRule>,
     #[serde(default)]
     pub mod_sync: ModSyncSettings,
+    /// Jar filename glob -> OS names the jar is installed on
+    #[serde(default)]
+    pub os_specific_mods: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub resource_sync: ResourceSyncMode,
 
@@ -431,6 +497,14 @@ pub enum GenerateError {
     DuplicateOptionalSet(String),
     #[error("failed to extract mod id from {0}: {1}")]
     ModIdExtract(String, String),
+    #[error("invalid mod glob '{0}': {1}")]
+    InvalidModGlob(String, String),
+    #[error("unknown OS '{0}', expected one of windows, osx, linux")]
+    UnknownOs(String),
+    #[error("mod jar matches globs with different OS lists: {0}")]
+    ConflictingModOs(String),
+    #[error("mod id appears in more than one jar for the same OS: {0}")]
+    DuplicateModId(String),
 }
 
 pub struct GeneratorResult {
@@ -453,6 +527,18 @@ impl InstanceGenerator {
         instance_dir: &InstanceDirFS,
         work_dir: &Path,
         os_arch: &OsArch,
+    ) -> Result<GeneratorResult, GenerateError> {
+        self.generate_with_mod_entries(instance_dir, work_dir, os_arch, None)
+            .await
+    }
+
+    /// With `mod_entries`, `source_root`'s `mods/` isn't scanned.
+    pub async fn generate_with_mod_entries(
+        self,
+        instance_dir: &InstanceDirFS,
+        work_dir: &Path,
+        os_arch: &OsArch,
+        mod_entries: Option<Vec<ModEntry>>,
     ) -> Result<GeneratorResult, GenerateError> {
         let output_dir = instance_dir.data_dir();
         let work_data_dir = DataDir::new(work_dir.to_path_buf());
@@ -641,9 +727,10 @@ impl InstanceGenerator {
 
             if remote_config.replace_download_urls {
                 for metadata in metadata.iter_mut() {
-                    info!("Replacing download URLs in {} metadata", &metadata.id);
+                    info!("Replacing download URLs in {} metadata", metadata.id);
                     *metadata = metadata
                         .with_replaced_download_urls(
+                            &self.client,
                             &remote_config.download_server_base,
                             output_dir,
                         )
@@ -661,7 +748,11 @@ impl InstanceGenerator {
                 .to_resources_url_base(&include_config.download_server_base);
         }
 
-        let mod_entries = if let (Some(source_root), Some(remote_config)) =
+        let mod_entries = if let Some(mut entries) = mod_entries {
+            entries.sort_by(|left, right| left.mod_id.cmp(&right.mod_id));
+            validate_duplicate_mod_ids(&entries)?;
+            entries
+        } else if let (Some(source_root), Some(remote_config)) =
             (&self.spec.source_root, &self.remote_config)
         {
             let entries = collect_mod_entries(
@@ -669,6 +760,7 @@ impl InstanceGenerator {
                 &remote_config.download_server_base,
                 instance_dir.rel(),
                 &self.spec.mod_sync,
+                &self.spec.os_specific_mods,
             )
             .await?;
             copy_tasks.extend(entries.iter().map(|entry| CopyTask {
@@ -705,5 +797,85 @@ impl InstanceGenerator {
             copy_tasks,
             other_generated_files,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filters(rules: &[(&str, &[&str])]) -> Vec<(GlobMatcher, Vec<String>)> {
+        let map = rules
+            .iter()
+            .map(|(pattern, os)| {
+                (
+                    pattern.to_string(),
+                    os.iter().map(|os| os.to_string()).collect(),
+                )
+            })
+            .collect();
+        compile_os_filters(&map).unwrap()
+    }
+
+    fn entry(mod_id: &str, file_name: &str, os: &[&str]) -> ModEntry {
+        ModEntry {
+            mod_id: mod_id.to_string(),
+            object: Object {
+                path: RelativePathBuf::from(format!("mods/{file_name}")),
+                sha1: String::new(),
+                size: 0,
+                url: Url::parse("https://example.com/mod.jar").unwrap(),
+            },
+            os: os.iter().map(|os| os.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn glob_assigns_os() {
+        let filters = filters(&[
+            ("voxy-*-macos.jar", &["osx"]),
+            ("voxy-*-win.jar", &["windows"]),
+        ]);
+        assert_eq!(
+            match_os_filters(&filters, "voxy-0.2.2-macos.jar").unwrap(),
+            vec!["osx"]
+        );
+        assert!(match_os_filters(&filters, "sodium.jar").unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicting_globs_error() {
+        let filters = filters(&[("voxy-*.jar", &["osx"]), ("*-win.jar", &["windows"])]);
+        assert!(matches!(
+            match_os_filters(&filters, "voxy-1-win.jar"),
+            Err(GenerateError::ConflictingModOs(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_os_errors() {
+        let map = HashMap::from([("*.jar".to_string(), vec!["macos".to_string()])]);
+        assert!(matches!(
+            compile_os_filters(&map),
+            Err(GenerateError::UnknownOs(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_mod_id_needs_disjoint_os() {
+        assert!(
+            validate_duplicate_mod_ids(&[
+                entry("voxy", "a.jar", &["osx"]),
+                entry("voxy", "b.jar", &["windows"]),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_duplicate_mod_ids(&[
+                entry("voxy", "a.jar", &["osx"]),
+                entry("voxy", "b.jar", &[]),
+            ])
+            .is_err()
+        );
     }
 }

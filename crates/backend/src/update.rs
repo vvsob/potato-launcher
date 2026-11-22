@@ -1,25 +1,131 @@
-use std::{env, fs, process::Command, sync::Arc};
+use std::{env, fs, path::Path, process::Command, sync::Arc};
 
 use futures::StreamExt as _;
-use launcher_bridge::{FrontendSender, MessageToFrontend, UpdateStatusView};
-use reqwest::Client;
+use launcher_bridge::{FrontendSender, MessageToFrontend, NotificationLevel, UpdateStatusView};
+use launcher_build_config::UpdateSource;
+use reqwest::{
+    Client,
+    header::{ACCEPT, USER_AGENT},
+};
+use serde::Deserialize;
 
-fn update_url() -> Option<String> {
-    launcher_build_config::backend_api_base().map(|base| {
-        #[cfg(target_os = "windows")]
-        return format!("{base}/launchers/windows/exe");
-        #[cfg(target_os = "linux")]
-        return format!("{base}/launchers/linux/bin");
-        #[cfg(target_os = "macos")]
-        return format!("{base}/launchers/macos/archive");
-    })
+/// A package manager owns the installed binary, so the launcher must not
+/// replace it and can only tell the user that an update is available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackagedInstall {
+    Flatpak,
+    Nix,
 }
 
-fn version_url() -> Option<String> {
-    update_url().map(|url| format!("{url}/version"))
+fn packaged_install() -> Option<PackagedInstall> {
+    if env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists() {
+        return Some(PackagedInstall::Flatpak);
+    }
+    if env::current_exe().is_ok_and(|exe| exe.starts_with("/nix/store")) {
+        return Some(PackagedInstall::Nix);
+    }
+    None
 }
 
-pub fn should_check_updates() -> bool {
+fn os_dir() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "windows";
+    #[cfg(target_os = "linux")]
+    return "linux";
+    #[cfg(target_os = "macos")]
+    return "macos";
+}
+
+fn release_file(package: Option<PackagedInstall>) -> String {
+    let lower = launcher_build_config::release_lower_name();
+    if package == Some(PackagedInstall::Flatpak) {
+        return format!("{lower}.flatpak");
+    }
+    #[cfg(target_os = "windows")]
+    return format!("{}.exe", launcher_build_config::launcher_name());
+    #[cfg(target_os = "linux")]
+    return lower;
+    #[cfg(target_os = "macos")]
+    return format!("{lower}_macos.tar.gz");
+}
+
+/// The name `potato publish-launcher` stores the file under on the site.
+fn site_file(package: Option<PackagedInstall>) -> &'static str {
+    if package == Some(PackagedInstall::Flatpak) {
+        return "launcher.flatpak";
+    }
+    #[cfg(target_os = "windows")]
+    return "launcher.exe";
+    #[cfg(target_os = "linux")]
+    return "launcher";
+    #[cfg(target_os = "macos")]
+    return "launcher_macos.tar.gz";
+}
+
+struct Release {
+    version: String,
+    download_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn fetch_release(
+    client: &Client,
+    package: Option<PackagedInstall>,
+) -> anyhow::Result<Release> {
+    match launcher_build_config::update_source() {
+        None => Err(anyhow::anyhow!("No update source configured")),
+        Some(UpdateSource::Static(base)) => {
+            let dir = format!("{base}/{}", os_dir());
+            let version = client
+                .get(format!("{dir}/version.txt"))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            Ok(Release {
+                version: version.trim().to_string(),
+                download_url: Some(format!("{dir}/{}", site_file(package))),
+            })
+        }
+        Some(UpdateSource::GitHub(repo)) => {
+            let file = release_file(package);
+            let release: GitHubRelease = client
+                .get(format!(
+                    "https://api.github.com/repos/{repo}/releases/latest"
+                ))
+                .header(USER_AGENT, "potato-launcher")
+                .header(ACCEPT, "application/vnd.github+json")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let download_url = release
+                .assets
+                .into_iter()
+                .find(|asset| asset.name == file)
+                .map(|asset| asset.browser_download_url);
+            Ok(Release {
+                version: release.tag_name,
+                download_url,
+            })
+        }
+    }
+}
+
+fn should_check_updates() -> bool {
     if env::var("CARGO").is_ok() {
         log::info!("Running from cargo, skipping auto-update");
         return false;
@@ -28,8 +134,8 @@ pub fn should_check_updates() -> bool {
         log::info!("Version not set, skipping auto-update");
         return false;
     }
-    if launcher_build_config::backend_api_base().is_none() {
-        log::info!("Backend API base not set, skipping auto-update");
+    if launcher_build_config::update_source().is_none() {
+        log::info!("Update source not set, skipping auto-update");
         return false;
     }
     true
@@ -49,26 +155,34 @@ fn is_read_only_error(e: &anyhow::Error) -> bool {
     false
 }
 
-async fn fetch_new_version(client: &Client) -> anyhow::Result<String> {
-    let version_url = version_url().ok_or_else(|| anyhow::anyhow!("No update URL configured"))?;
-    let text = client
-        .get(version_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    Ok(text.trim().to_string())
-}
-
-async fn need_update(client: &Client) -> anyhow::Result<bool> {
-    let remote = fetch_new_version(client).await?;
+async fn newer_release(
+    client: &Client,
+    package: Option<PackagedInstall>,
+) -> anyhow::Result<Option<Release>> {
+    let release = fetch_release(client, package).await?;
     let local = launcher_build_config::version().expect("version checked in should_check_updates");
-    Ok(remote != local)
+    Ok(is_newer(&release.version, local).then_some(release))
 }
 
-async fn download(client: &Client, frontend: &FrontendSender) -> anyhow::Result<Vec<u8>> {
-    let url = update_url().ok_or_else(|| anyhow::anyhow!("No update URL configured"))?;
+/// Semver when both parse (`v` prefix allowed), otherwise any difference.
+fn is_newer(remote: &str, local: &str) -> bool {
+    let parse =
+        |version: &str| semver::Version::parse(version.strip_prefix('v').unwrap_or(version)).ok();
+    match (parse(remote), parse(local)) {
+        (Some(remote), Some(local)) => remote > local,
+        _ => remote != local,
+    }
+}
+
+async fn download(
+    client: &Client,
+    frontend: &FrontendSender,
+    release: &Release,
+) -> anyhow::Result<Vec<u8>> {
+    let url = release
+        .download_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Release {} has no file for this OS", release.version))?;
     let response = client.get(url).send().await?.error_for_status()?;
     let total = response.content_length().unwrap_or(0);
     let mut bytes = Vec::with_capacity(total as usize);
@@ -86,16 +200,20 @@ async fn download(client: &Client, frontend: &FrontendSender) -> anyhow::Result<
     Ok(bytes)
 }
 
+/// Starts a fresh launcher process with the same arguments and exits this one.
+pub fn restart_launcher() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    Command::new(env::current_exe()?).args(&args[1..]).spawn()?;
+    std::process::exit(0);
+}
+
 #[cfg(not(target_os = "macos"))]
 fn replace_and_restart(new_binary: &[u8]) -> anyhow::Result<()> {
-    let current_exe = env::current_exe()?;
     let temp_exe = env::temp_dir().join("new_launcher_update");
     fs::write(&temp_exe, new_binary)?;
     self_replace::self_replace(&temp_exe)?;
     fs::remove_file(&temp_exe).ok();
-    let args: Vec<String> = env::args().collect();
-    Command::new(&current_exe).args(&args[1..]).spawn()?;
-    std::process::exit(0);
+    restart_launcher()
 }
 
 #[cfg(target_os = "macos")]
@@ -143,17 +261,53 @@ fn replace_and_restart(new_archive: &[u8]) -> anyhow::Result<()> {
     fs::rename(temp_dir.join("update.app"), bundle_dir)?;
     fs::remove_dir_all(&backup_dir).ok();
 
-    let args: Vec<String> = env::args().collect();
-    Command::new(&current_exe).args(&args[1..]).spawn()?;
-    std::process::exit(0);
+    restart_launcher()
 }
 
-pub async fn run(client: Client, frontend: FrontendSender) {
-    match need_update(&client).await {
-        Ok(false) => {
+/// Starts the update check. Self-updating installs block on the update screen
+/// until it finishes; package-managed installs only get a notification.
+pub fn start(client: Client, frontend: FrontendSender) {
+    if !should_check_updates() {
+        frontend.send(MessageToFrontend::UpdateStatus(
+            UpdateStatusView::NotApplicable,
+        ));
+        return;
+    }
+    if let Some(package) = packaged_install() {
+        log::info!("Installed via {package:?}, only checking for update notifications");
+        frontend.send(MessageToFrontend::UpdateStatus(
+            UpdateStatusView::NotApplicable,
+        ));
+        tokio::spawn(notify_if_outdated(client, frontend, package));
+    } else {
+        frontend.send(MessageToFrontend::UpdateStatus(UpdateStatusView::Checking));
+        tokio::spawn(run(client, frontend));
+    }
+}
+
+async fn notify_if_outdated(client: Client, frontend: FrontendSender, package: PackagedInstall) {
+    match newer_release(&client, Some(package)).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            let message = match package {
+                PackagedInstall::Flatpak => launcher_i18n::update::available_flatpak(),
+                PackagedInstall::Nix => launcher_i18n::update::available_nix(),
+            };
+            frontend.send(MessageToFrontend::Notification {
+                level: NotificationLevel::Warning,
+                message: Arc::from(message),
+            });
+        }
+        Err(e) => log::warn!("Failed to check for updates: {e:#}"),
+    }
+}
+
+async fn run(client: Client, frontend: FrontendSender) {
+    match newer_release(&client, None).await {
+        Ok(None) => {
             frontend.send(MessageToFrontend::UpdateStatus(UpdateStatusView::UpToDate));
         }
-        Ok(true) => match download(&client, &frontend).await {
+        Ok(Some(release)) => match download(&client, &frontend, &release).await {
             Ok(bytes) => {
                 frontend.send(MessageToFrontend::UpdateStatus(UpdateStatusView::Replacing));
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -190,5 +344,20 @@ pub async fn run(client: Client, frontend: FrontendSender) {
                 offline: is_connect_error(&e),
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_newer;
+
+    #[test]
+    fn compares_release_tags() {
+        assert!(is_newer("v1.2.0", "v1.1.9"));
+        assert!(!is_newer("v1.1.0", "v1.2.0"));
+        assert!(!is_newer("v1.2.0", "v1.2.0"));
+        assert!(is_newer("v1.2.0", "v1.2.0-rc1"));
+        assert!(is_newer("v0.0.1-dev2", "v0.0.1-dev1"));
+        assert!(is_newer("v1.0.0", "3f2a9c1"));
     }
 }

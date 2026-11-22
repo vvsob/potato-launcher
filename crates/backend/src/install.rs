@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsStr,
-    fs, io,
+    io,
     path::Path,
     sync::Arc,
 };
@@ -658,6 +657,16 @@ fn apply_toml_config_options(
     Ok(())
 }
 
+fn split_property_line(line: &str) -> Option<(&str, char)> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+        return None;
+    }
+    let index = trimmed.find(['=', ':'])?;
+    let separator = trimmed[index..].chars().next()?;
+    Some((trimmed[..index].trim_end(), separator))
+}
+
 fn apply_properties_config_options(
     contents: &str,
     options: &[utils::files::ConfigOption],
@@ -666,6 +675,10 @@ fn apply_properties_config_options(
         .lines()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let default_separator = lines
+        .iter()
+        .find_map(|line| split_property_line(line))
+        .map_or('=', |(_, separator)| separator);
 
     for option in options {
         let [Either::Left(key)] = option.key.as_slice() else {
@@ -692,23 +705,13 @@ fn apply_properties_config_options(
             }
         };
 
-        let mut replaced = false;
-        for line in &mut lines {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-                continue;
-            }
-            let Some(separator) = trimmed.find(['=', ':']) else {
-                continue;
-            };
-            if trimmed[..separator].trim_end() == key {
-                *line = format!("{key}={value}");
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            lines.push(format!("{key}={value}"));
+        let existing = lines.iter_mut().find_map(|line| {
+            let (line_key, separator) = split_property_line(line)?;
+            (line_key == key).then_some((line, separator))
+        });
+        match existing {
+            Some((line, separator)) => *line = format!("{key}{separator}{value}"),
+            None => lines.push(format!("{key}{default_separator}{value}")),
         }
     }
 
@@ -898,7 +901,7 @@ pub(crate) async fn apply_optional_mod_set(
     let mod_ids = set.mod_ids.iter().cloned().collect::<HashSet<_>>();
 
     for entry in &metadata.mod_entries {
-        if !mod_ids.contains(&entry.mod_id) {
+        if !mod_ids.contains(&entry.mod_id) || !entry.applies_to_current_os() {
             continue;
         }
         let filename =
@@ -1061,42 +1064,13 @@ async fn extract_natives_if_needed(
     tokio::fs::create_dir_all(&natives_dir).await?;
 
     for native_path in &native_paths {
-        extract_zip(native_path, &natives_dir)?;
+        files::extract_zip(native_path, &natives_dir, true).await?;
         progress.inc(1);
     }
 
     // marker last: an interrupted extraction must not look complete
     tokio::fs::write(&marker_path, fingerprint).await?;
     progress.finish();
-    Ok(())
-}
-
-fn extract_zip(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let file = fs::File::open(src)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    for index in 0..zip.len() {
-        let mut entry = zip.by_index(index)?;
-        let Some(enclosed_name) = entry.enclosed_name() else {
-            continue;
-        };
-        if enclosed_name
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str() == OsStr::new("META-INF"))
-        {
-            continue;
-        }
-        let output_path = dest.join(enclosed_name);
-        if entry.is_dir() {
-            fs::create_dir_all(&output_path)?;
-        } else {
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut output = fs::File::create(output_path)?;
-            io::copy(&mut entry, &mut output)?;
-        }
-    }
     Ok(())
 }
 
@@ -1134,6 +1108,8 @@ mod tests {
             sha1: "abc".to_string(),
             auth_backend: None,
             required_java_version: "8".to_string(),
+            minecraft_version: None,
+            loader: None,
         };
         let id = remote_entry_handle(&url, &entry.id);
         let catalogs = HashMap::from([(
@@ -1272,6 +1248,35 @@ mod tests {
         assert!(contents.contains("max-count=5\n"));
     }
 
+    #[tokio::test]
+    async fn config_option_task_keeps_colon_separator() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("options.txt");
+        tokio::fs::write(&path, "fov:0.0\nresourcePacks:[\"vanilla\"]\n")
+            .await
+            .unwrap();
+
+        run_config_option_task(&ConfigOptionTask {
+            path: path.clone(),
+            config_type: ConfigType::Properties,
+            options: vec![
+                config_option(
+                    vec![key("resourcePacks")],
+                    json!(r#"["vanilla","file/pack.zip"]"#),
+                ),
+                config_option(vec![key("gamma")], json!(1.0)),
+            ],
+        })
+        .await
+        .unwrap();
+
+        let contents = tokio::fs::read_to_string(path).await.unwrap();
+        assert_eq!(
+            contents,
+            "fov:0.0\nresourcePacks:[\"vanilla\",\"file/pack.zip\"]\ngamma:1.0\n"
+        );
+    }
+
     #[test]
     fn resolves_existing_remote_instance_for_update() {
         let url = Url::parse("https://example.com/data/instance_manifest.json").unwrap();
@@ -1291,6 +1296,8 @@ mod tests {
             sha1: "new".to_string(),
             auth_backend: None,
             required_java_version: "8".to_string(),
+            minecraft_version: None,
+            loader: None,
         };
         let catalogs = HashMap::from([(
             url.clone(),

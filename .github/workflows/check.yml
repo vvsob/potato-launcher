@@ -2,10 +2,14 @@ name: Check
 
 on:
   push:
+    branches:
+      - '**'
+      - '!master'
     paths-ignore:
       - 'docs/**'
       - '.github/workflows/docs.yml'
   pull_request:
+  workflow_call:
 
 defaults:
   run:
@@ -20,13 +24,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -44,53 +49,3 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --workspace
 
-  backend:
-    name: Backend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
-
-      - name: Go fmt (check)
-        working-directory: backend
-        run: test -z "$(gofmt -l .)"
-
-      - name: Go vet
-        working-directory: backend
-        run: go vet ./...
-
-      - name: Go test
-        working-directory: backend
-        run: go test ./...
-
-  frontend:
-    name: Frontend
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-
-      - name: Enable Corepack + activate Yarn 4
-        run: |
-          corepack enable
-
-      - name: Install
-        run: yarn install --immutable
-
-      - name: Typecheck
-        run: yarn type-check
-
-      - name: Build
-        run: yarn build-only

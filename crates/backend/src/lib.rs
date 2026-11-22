@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use catalog::{
     BackendCatalogEntry, CatalogFetchResult, backend_status, delete_cached_manifest,
@@ -22,8 +23,8 @@ use instance::{
     install_params::InstallCause,
     instance_metadata::InstanceMetadata,
     storage::{
-        InstanceHandle, InstanceStorage, InstanceUserSettings, LocalInstance, RemoteSource,
-        load_instance_settings, save_instance_settings,
+        InstanceHandle, InstanceStorage, InstanceUserSettings, JvmGcOpts, LocalInstance,
+        RemoteSource, load_instance_settings, save_instance_settings,
     },
 };
 use launcher_auth::{
@@ -48,7 +49,6 @@ use url::Url;
 use utils::{
     files,
     paths::{DataDir, InstanceDirFS, InstancesDir},
-    progress::ProgressTracker as _,
 };
 
 const SETTINGS_FILE: &str = "settings.json";
@@ -529,10 +529,11 @@ impl BackendState {
                         selected_account: settings.selected_account.clone(),
                         account_override: settings.account_override.clone(),
                         xmx_mb: settings.xmx_mb,
-                        jvm_flags: settings
-                            .jvm_flags
+                        jvm_opts: settings
+                            .jvm_opts
                             .as_ref()
-                            .map(|flags| Arc::<str>::from(flags.clone())),
+                            .map(|args| Arc::<str>::from(args.clone())),
+                        jvm_gc_opts: settings.jvm_gc_opts,
                         java_path: settings
                             .java_path
                             .as_ref()
@@ -565,7 +566,9 @@ impl BackendState {
                         display_name: metadata.display_name.clone(),
                         auth_provider: metadata.auth_backend.clone(),
                         default_xmx_mb: parse_xmx_mb(metadata.default_xmx.as_deref()),
-                        required_java_version: Some(Arc::from(metadata.get_java_version())),
+                        required_java_version: Some(metadata.get_java_version()),
+                        minecraft_version: metadata.minecraft_version(),
+                        loader: metadata.loader_name(),
                         mod_sync: metadata.mod_sync.clone(),
                     },
                 ))
@@ -1082,6 +1085,40 @@ impl BackendState {
         );
     }
 
+    async fn delete_all_launcher_data(&mut self, tx: &FrontendSender) {
+        if !self.activities.is_empty() {
+            tx.send(MessageToFrontend::Notification {
+                level: NotificationLevel::Warning,
+                message: Arc::from(launcher_i18n::notifications::delete_all_data_busy()),
+            });
+            return;
+        }
+        if let Some(cancel) = self.add_account_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(task) = self.add_account_task.take() {
+            task.abort();
+        }
+
+        log::warn!(
+            "Deleting all launcher data in {}",
+            self.launcher_dir.display()
+        );
+        let result = match delete_launcher_data(&self.launcher_dir).await {
+            Ok(()) => update::restart_launcher(),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            log::error!("Failed to delete all launcher data: {err:#}");
+            tx.send(MessageToFrontend::Notification {
+                level: NotificationLevel::Error,
+                message: Arc::from(launcher_i18n::notifications::failed_delete_all_data(
+                    err.to_string(),
+                )),
+            });
+        }
+    }
+
     async fn delete_instance(&mut self, handle: InstanceHandle, tx: &FrontendSender) {
         match self.activity_kind(&handle) {
             Some(instances::ActivityKind::LaunchPrep | instances::ActivityKind::Running) => {
@@ -1547,22 +1584,43 @@ impl BackendState {
         self.emit_snapshot(tx);
     }
 
-    async fn set_instance_jvm_flags(
+    async fn set_instance_jvm_opts(
         &mut self,
         instance: InstanceHandle,
-        flags: Option<String>,
+        opts: Option<String>,
         tx: &FrontendSender,
     ) {
         let normalized =
-            flags.and_then(|flags| (!flags.trim().is_empty()).then(|| flags.trim().to_string()));
+            opts.and_then(|opts| (!opts.trim().is_empty()).then(|| opts.trim().to_string()));
         if let Err(err) = self
-            .update_instance_settings(&instance, |settings| settings.jvm_flags = normalized)
+            .update_instance_settings(&instance, |settings| settings.jvm_opts = normalized)
             .await
         {
-            log::error!("Failed to save JVM flags for instance {instance}: {err:#}");
+            log::error!("Failed to save JVM options for instance {instance}: {err:#}");
             tx.send(MessageToFrontend::Notification {
                 level: NotificationLevel::Error,
-                message: Arc::from(launcher_i18n::notifications::failed_save_jvm_flags(
+                message: Arc::from(launcher_i18n::notifications::failed_save_jvm_opts(
+                    err.to_string(),
+                )),
+            });
+        }
+        self.emit_snapshot(tx);
+    }
+
+    async fn set_instance_jvm_gc_opts(
+        &mut self,
+        instance: InstanceHandle,
+        choice: JvmGcOpts,
+        tx: &FrontendSender,
+    ) {
+        if let Err(err) = self
+            .update_instance_settings(&instance, |settings| settings.jvm_gc_opts = choice)
+            .await
+        {
+            log::error!("Failed to save GC options for instance {instance}: {err:#}");
+            tx.send(MessageToFrontend::Notification {
+                level: NotificationLevel::Error,
+                message: Arc::from(launcher_i18n::notifications::failed_save_jvm_opts(
                     err.to_string(),
                 )),
             });
@@ -1876,7 +1934,8 @@ impl BackendState {
             None,
         );
         let xmx_mb = settings.xmx_mb;
-        let jvm_flags = settings.jvm_flags.clone();
+        let jvm_opts = settings.jvm_opts.clone();
+        let jvm_gc_opts = settings.jvm_gc_opts;
         let use_native_glfw = settings.use_native_glfw;
         let launcher_dir = self.launcher_dir.clone();
         let client = self.client.clone();
@@ -1884,13 +1943,9 @@ impl BackendState {
         let frontend = tx.clone();
         let (kill_tx, mut kill_rx) = oneshot::channel();
         let task_handle = handle.clone();
+        let initial_tasks = tasks.snapshot();
         let task = tokio::spawn(async move {
             // 1. authenticate before any sync starts
-            let auth_task = tasks.task(
-                launcher_bridge::TaskKind::Auth,
-                launcher_bridge::ProgressUnit::Items,
-                launcher_i18n::progress::authenticating(),
-            );
             let auth_messages = Arc::new(launch::InstanceAuthMessages::new(
                 frontend.clone(),
                 task_handle.clone(),
@@ -1917,7 +1972,6 @@ impl BackendState {
                     return;
                 }
             };
-            auth_task.finish();
             if let Some(refreshed) = &authenticated.refreshed {
                 let _ = internal.send(BackendEvent::AccountUpdated {
                     provider: authenticated.provider.clone(),
@@ -1997,7 +2051,8 @@ impl BackendState {
                 account_data: authenticated.data,
                 online: authenticated.online,
                 xmx_mb,
-                jvm_flags,
+                jvm_opts,
+                jvm_gc_opts,
                 java,
                 use_native_glfw,
                 launcher_dir,
@@ -2035,7 +2090,7 @@ impl BackendState {
                 }
             }
         });
-        let mut activity = Activity::new(instances::ActivityKind::LaunchPrep, Arc::from([]), task);
+        let mut activity = Activity::new(instances::ActivityKind::LaunchPrep, initial_tasks, task);
         activity.kill = Some(kill_tx);
         self.activities.insert(handle, activity);
     }
@@ -2148,6 +2203,29 @@ impl BackendState {
     }
 }
 
+/// Removes everything in the launcher directory except `logs`, which holds the
+/// log file this process is still writing to.
+async fn delete_launcher_data(launcher_dir: &Path) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(launcher_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name() == "logs" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        }
+        .with_context(|| format!("failed to delete {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn exit_outcome(status: std::io::Result<std::process::ExitStatus>) -> launcher_bridge::ExitOutcome {
     match status {
         Ok(status) if status.success() => launcher_bridge::ExitOutcome::Success,
@@ -2173,37 +2251,75 @@ fn parse_xmx_mb(value: Option<&str>) -> Option<u64> {
     }
 }
 
+/// Bump when older launchers can't read the data folder anymore, and migrate in `check_data_format`.
+const DATA_FORMAT: u32 = 1;
+const DATA_FORMAT_FILE: &str = "data_format";
+/// Must stay under `potato gc`'s default 2-hour grace.
+const CATALOG_REFRESH: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+async fn check_data_format(launcher_dir: &Path) -> anyhow::Result<bool> {
+    let path = launcher_dir.join(DATA_FORMAT_FILE);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => {
+            let found = content.trim().parse::<u32>().unwrap_or(u32::MAX);
+            if found > DATA_FORMAT {
+                return Ok(false);
+            }
+            if found == DATA_FORMAT {
+                return Ok(true);
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    tokio::fs::create_dir_all(launcher_dir).await?;
+    files::write_file_atomic(&path, format!("{DATA_FORMAT}\n").as_bytes()).await?;
+    Ok(true)
+}
+
 pub async fn run(
     launcher_dir: PathBuf,
     mut receiver: BackendReceiver,
     frontend: FrontendSender,
 ) -> anyhow::Result<()> {
+    if !check_data_format(&launcher_dir).await? {
+        // Don't touch newer data; self-update still runs.
+        set_lang(resolve_language_code(
+            Some(detect_system_language_code()),
+            None,
+        ));
+        update::start(reqwest::Client::new(), frontend.clone());
+        frontend.send(MessageToFrontend::Notification {
+            level: NotificationLevel::Error,
+            message: Arc::from(launcher_i18n::notifications::data_from_newer_launcher()),
+        });
+        while receiver.recv().await.is_some() {}
+        return Ok(());
+    }
     let mut state = BackendState::load(launcher_dir).await?;
     let (internal_sender, mut internal_receiver) = mpsc::unbounded_channel();
 
-    if update::should_check_updates() {
-        frontend.send(MessageToFrontend::UpdateStatus(
-            launcher_bridge::UpdateStatusView::Checking,
-        ));
-        let update_client = state.client.clone();
-        let update_frontend = frontend.clone();
-        tokio::spawn(async move {
-            update::run(update_client, update_frontend).await;
-        });
-    } else {
-        frontend.send(MessageToFrontend::UpdateStatus(
-            launcher_bridge::UpdateStatusView::NotApplicable,
-        ));
-    }
+    update::start(state.client.clone(), frontend.clone());
 
     state.emit_snapshot(&frontend);
     for (level, message) in state.startup_notices.drain(..) {
         frontend.send(MessageToFrontend::Notification { level, message });
     }
     state.refresh_all(&internal_sender, &frontend).await;
+    let mut catalog_refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + CATALOG_REFRESH,
+        CATALOG_REFRESH,
+    );
+    catalog_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = catalog_refresh.tick() => {
+                for (url, _, _) in state.visible_backend_urls() {
+                    state.start_fetch(url, &internal_sender);
+                }
+                state.emit_snapshot(&frontend);
+            }
             message = receiver.recv() => {
                 let Some(message) = message else {
                     break;
@@ -2299,8 +2415,11 @@ pub async fn run(
                     MessageToBackend::SetInstanceMemory { instance, xmx_mb } => {
                         state.set_instance_memory(instance, xmx_mb, &frontend).await;
                     }
-                    MessageToBackend::SetInstanceJvmFlags { instance, flags } => {
-                        state.set_instance_jvm_flags(instance, flags, &frontend).await;
+                    MessageToBackend::SetInstanceJvmOpts { instance, opts } => {
+                        state.set_instance_jvm_opts(instance, opts, &frontend).await;
+                    }
+                    MessageToBackend::SetInstanceJvmGcOpts { instance, choice } => {
+                        state.set_instance_jvm_gc_opts(instance, choice, &frontend).await;
                     }
                     MessageToBackend::SetInstanceJavaPath { instance, path } => {
                         state.set_instance_java_path(instance, path, &frontend).await;
@@ -2362,6 +2481,9 @@ pub async fn run(
                             minecraft_version,
                             loader,
                         );
+                    }
+                    MessageToBackend::DeleteAllLauncherData => {
+                        state.delete_all_launcher_data(&frontend).await;
                     }
                     MessageToBackend::ProceedAfterUpdateFailure => {
                         frontend.send(MessageToFrontend::UpdateStatus(
@@ -2432,4 +2554,21 @@ pub async fn run(
 
     frontend.send(MessageToFrontend::Quit);
     Ok(())
+}
+
+#[cfg(test)]
+mod data_format_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_newer_data_and_marks_new_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_data_format(dir.path()).await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(DATA_FORMAT_FILE)).unwrap(),
+            format!("{DATA_FORMAT}\n")
+        );
+        std::fs::write(dir.path().join(DATA_FORMAT_FILE), "999\n").unwrap();
+        assert!(!check_data_format(dir.path()).await.unwrap());
+    }
 }

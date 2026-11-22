@@ -10,8 +10,8 @@ pub fn lower_launcher_name() -> String {
     normalize_launcher_name(LAUNCHER_NAME)
 }
 
-pub fn data_dir_name() -> &'static str {
-    "potato-launcher"
+pub fn data_dir_name() -> String {
+    LAUNCHER_DATA_DIR.map_or_else(lower_launcher_name, str::to_string)
 }
 
 fn normalize_launcher_name(value: &str) -> String {
@@ -53,11 +53,28 @@ pub fn default_instance_manifest_urls() -> Vec<Url> {
         .collect()
 }
 
-pub fn backend_api_base() -> Option<Url> {
-    BACKEND_API_BASE.and_then(|url| Url::parse(url).ok())
+pub enum UpdateSource {
+    Static(String),
+    GitHub(&'static str),
 }
 
-pub fn version() -> Option<&'static str> {
+pub fn update_source() -> Option<UpdateSource> {
+    if let Some(url) = LAUNCHER_UPDATE_URL {
+        return Some(UpdateSource::Static(url.trim_end_matches('/').to_string()));
+    }
+    LAUNCHER_UPDATE_GITHUB.map(UpdateSource::GitHub)
+}
+
+/// Same as `LOWER_LAUNCHER_NAME` in scripts/ci/set-build-env.sh.
+pub fn release_lower_name() -> String {
+    release_lower(LAUNCHER_NAME)
+}
+
+fn release_lower(value: &str) -> String {
+    value.to_lowercase().replace('\'', "").replace(' ', "_")
+}
+
+pub const fn version() -> Option<&'static str> {
     VERSION
 }
 
@@ -80,5 +97,11 @@ mod tests {
             "potato-launcher"
         );
         assert_eq!(normalize_launcher_name("___"), "launcher");
+    }
+
+    #[test]
+    fn release_lower_matches_ci() {
+        assert_eq!(release_lower("Potato Launcher"), "potato_launcher");
+        assert_eq!(release_lower("Petr's Launcher"), "petrs_launcher");
     }
 }

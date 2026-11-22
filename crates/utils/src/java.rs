@@ -1,5 +1,7 @@
 use flate2::read::GzDecoder;
 use futures::StreamExt;
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+use object::{Architecture, FileKind, Object};
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
@@ -101,14 +103,16 @@ pub async fn get_installation_pub(path: &Path) -> Option<JavaInstallation> {
     get_installation(path).await
 }
 
-async fn get_installation(path: &Path) -> Option<JavaInstallation> {
-    let path = if path.is_file() {
-        path.to_path_buf()
+fn resolve_binary_path(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        Some(path.to_path_buf())
     } else {
-        which::which(path).ok()?
-    };
+        which::which(path).ok()
+    }
+}
 
-    let mut cmd = Command::new(&path);
+async fn read_java_version(path: &Path) -> Option<String> {
+    let mut cmd = Command::new(path);
     #[cfg(target_os = "windows")]
     {
         use winapi::um::winbase::CREATE_NO_WINDOW;
@@ -119,53 +123,75 @@ async fn get_installation(path: &Path) -> Option<JavaInstallation> {
 
     let version_result = String::from_utf8_lossy(&output.stderr);
     let captures = JAVA_VERSION_RGX.captures(&version_result)?;
+    Some(captures.get(1)?.as_str().to_string())
+}
 
-    let version = captures.get(1)?.as_str().to_string();
+async fn get_installation(path: &Path) -> Option<JavaInstallation> {
+    let path = resolve_binary_path(path)?;
+    let version = read_java_version(&path).await?;
     Some(JavaInstallation { version, path })
 }
 
-#[cfg(not(target_os = "windows"))]
-fn check_arch(java_version_output: &str) -> bool {
-    let arch = std::env::consts::ARCH;
-    match arch {
-        "x86_64" | "amd64" => java_version_output.contains("x86-64"),
-        "aarch64" => {
-            java_version_output.contains("aarch64") || java_version_output.contains("arm64")
-        }
+fn version_matches(version: &str, required_version: &str) -> bool {
+    version.starts_with(required_version) || version.starts_with(&format!("1.{required_version}"))
+}
+
+fn arch_is_current(architecture: Architecture) -> bool {
+    match std::env::consts::ARCH {
+        "x86_64" | "amd64" => architecture == Architecture::X86_64,
+        "aarch64" => architecture == Architecture::Aarch64,
         _ => false,
     }
 }
 
-#[cfg(target_os = "windows")]
-fn check_arch(_: &str) -> bool {
-    true
+fn binary_data_has_current_arch(data: &[u8]) -> bool {
+    match FileKind::parse(data) {
+        Ok(FileKind::MachOFat32) => MachOFatFile32::parse(data)
+            .map(|fat| {
+                fat.arches()
+                    .iter()
+                    .any(|arch| arch_is_current(arch.architecture()))
+            })
+            .unwrap_or(false),
+        Ok(FileKind::MachOFat64) => MachOFatFile64::parse(data)
+            .map(|fat| {
+                fat.arches()
+                    .iter()
+                    .any(|arch| arch_is_current(arch.architecture()))
+            })
+            .unwrap_or(false),
+        Ok(_) => object::File::parse(data)
+            .map(|file| arch_is_current(file.architecture()))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
-async fn does_match(java: &JavaInstallation, required_version: &str) -> bool {
-    if !(java.version.starts_with(&required_version.to_string())
-        || java.version.starts_with(&format!("1.{required_version}")))
-    {
-        return false;
-    }
-
+async fn binary_matches_current_arch(path: &Path) -> bool {
     if std::env::consts::ARCH != "aarch64" {
         return true;
     }
-    let output = Command::new("file").arg(&java.path).output().await;
-    if let Ok(output) = output {
-        let output = String::from_utf8_lossy(&output.stdout);
-        check_arch(&output)
-    } else {
-        false
+    match tokio::fs::read(path).await {
+        Ok(data) => binary_data_has_current_arch(&data),
+        Err(_) => false,
     }
 }
 
+async fn does_match(java: &JavaInstallation, required_version: &str) -> bool {
+    version_matches(&java.version, required_version)
+        && binary_matches_current_arch(&java.path).await
+}
+
 pub async fn check_java(required_version: &str, path: &Path) -> bool {
-    if let Some(installation) = get_installation(path).await {
-        does_match(&installation, required_version).await
-    } else {
-        false
-    }
+    let Some(path) = resolve_binary_path(path) else {
+        return false;
+    };
+    let (version, arch_ok) =
+        futures::join!(read_java_version(&path), binary_matches_current_arch(&path));
+    version
+        .as_deref()
+        .is_some_and(|version| version_matches(version, required_version))
+        && arch_ok
 }
 
 #[cfg(target_os = "windows")]
@@ -317,8 +343,8 @@ pub enum JavaDownloadError {
     Url(#[from] url::ParseError),
     #[error("file I/O failed while downloading/installing Java: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to extract Java ZIP archive: {0}")]
-    Zip(#[from] zip::result::ZipError),
+    #[error("failed to extract Java archive: {0}")]
+    Extract(#[from] crate::files::ExtractZipError),
 }
 
 fn get_java_download_params_for_target(
@@ -378,31 +404,39 @@ async fn java_archive_download_path(
 
 /// Zulu macOS archives ship as .app bundles where the JRE lives under
 /// {archive_root}/Contents/Home, while Linux/Windows archives use a flat layout.
-fn resolve_java_home_dir(extracted_root: &Path) -> PathBuf {
+async fn resolve_java_home_dir(extracted_root: &Path) -> PathBuf {
     let bundle_home = extracted_root.join("Contents").join("Home");
-    if bundle_home.is_dir() {
+    if tokio::fs::metadata(&bundle_home)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
         bundle_home
     } else {
         extracted_root.to_path_buf()
     }
 }
 
-fn install_extracted_java(
+async fn install_extracted_java(
     java_dir: &Path,
     filename: &str,
     target_dir: &Path,
 ) -> Result<(), JavaDownloadError> {
     let extracted_root = java_dir.join(filename);
-    let java_home_src = resolve_java_home_dir(&extracted_root);
+    let java_home_src = resolve_java_home_dir(&extracted_root).await;
 
-    if target_dir.exists() {
-        fs::remove_dir_all(target_dir)?;
+    if tokio::fs::try_exists(target_dir).await.unwrap_or(false) {
+        tokio::fs::remove_dir_all(target_dir).await?;
     }
 
-    fs::rename(&java_home_src, target_dir)?;
+    tokio::fs::rename(&java_home_src, target_dir).await?;
 
-    if java_home_src != extracted_root && extracted_root.exists() {
-        fs::remove_dir_all(&extracted_root)?;
+    if java_home_src != extracted_root
+        && tokio::fs::try_exists(&extracted_root)
+            .await
+            .unwrap_or(false)
+    {
+        tokio::fs::remove_dir_all(&extracted_root).await?;
     }
 
     Ok(())
@@ -448,28 +482,23 @@ async fn install_java_from_archive(
         .java_version_dir(required_version)
         .to_fs(data_dir);
 
-    // TODO: rewrite with async_zip
-    let archive_path = archive_path.to_path_buf();
-    let archive_type = archive_type.to_string();
-    tokio::task::spawn_blocking(move || -> Result<(), JavaDownloadError> {
-        if target_dir.exists() {
-            fs::remove_dir_all(&target_dir)?;
-        }
-
-        let archive = fs::File::open(&archive_path)?;
-        if archive_type == "tar.gz" {
+    if archive_type == "tar.gz" {
+        let archive_path = archive_path.to_path_buf();
+        let java_dir = java_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), JavaDownloadError> {
+            let archive = fs::File::open(&archive_path)?;
             let tar = GzDecoder::new(archive);
             let mut archive = Archive::new(tar);
             archive.unpack(&java_dir)?;
-        } else {
-            let mut archive = zip::ZipArchive::new(archive)?;
-            archive.extract(&java_dir)?;
-        }
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+    } else {
+        crate::files::extract_zip(archive_path, &java_dir, false).await?;
+    }
 
-        install_extracted_java(&java_dir, &filename, &target_dir)
-    })
-    .await
-    .map_err(std::io::Error::other)??;
+    install_extracted_java(&java_dir, &filename, &target_dir).await?;
 
     let java_path = JavaDir::root()
         .java_version_dir(required_version)

@@ -137,6 +137,15 @@ fn previous_rule_versions(rules: &[ContentRule]) -> HashMap<(String, &'static st
 pub struct ModEntry {
     pub mod_id: String,
     pub object: Object,
+    /// OS names from `get_os_name()`; empty means all
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+}
+
+impl ModEntry {
+    pub fn applies_to_current_os(&self) -> bool {
+        self.os.is_empty() || self.os.contains(&get_os_name())
+    }
 }
 
 pub use crate::install_params::{InstallCause, InstallParams};
@@ -335,7 +344,31 @@ impl InstanceMetadata {
             sha1: hash_struct(&self)?,
             auth_backend: self.auth_backend.clone(),
             required_java_version: self.get_java_version(),
+            minecraft_version: self.minecraft_version(),
+            loader: self.loader_name(),
         })
+    }
+
+    pub fn minecraft_version(&self) -> Option<String> {
+        self.versions.first().map(|version| version.id.clone())
+    }
+
+    /// From ids like `fabric-loader-0.16.9-1.21.1`, `neoforge-21.1.77` or `1.20.1-forge-47.2.0`.
+    pub fn loader_name(&self) -> Option<String> {
+        if self.versions.len() < 2 {
+            return None;
+        }
+        let id = &self.versions.last()?.id;
+        let name = if id.starts_with("fabric-loader-") {
+            "Fabric"
+        } else if id.starts_with("neoforge-") {
+            "NeoForge"
+        } else if id.contains("-forge-") {
+            "Forge"
+        } else {
+            return None;
+        };
+        Some(name.to_string())
     }
 
     pub async fn save(&self, instance_dir: &InstanceDirFS) -> Result<(), InstanceMetadataError> {
@@ -426,9 +459,9 @@ impl InstanceMetadata {
             );
         }
 
-        let mod_plan = build_mod_sync_plan(&self.mod_entries, &self.mod_sync, params)?;
+        let mod_plan = build_mod_sync_plan(&self.mod_entries, &self.mod_sync, params).await?;
         tasks += mod_plan.tasks;
-        tasks += self.get_include_tasks(params)?;
+        tasks += self.get_include_tasks(params).await?;
 
         Ok(InstallTasks {
             tasks,
@@ -527,7 +560,10 @@ impl InstanceMetadata {
         Ok(tasks)
     }
 
-    fn get_include_tasks(&self, params: &InstallParams) -> Result<TaskSet, InstanceMetadataError> {
+    async fn get_include_tasks(
+        &self,
+        params: &InstallParams,
+    ) -> Result<TaskSet, InstanceMetadataError> {
         let mut tasks = TaskSet::default();
         let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
@@ -610,7 +646,7 @@ impl InstanceMetadata {
                     }
                     if delete_extra {
                         let dir_path = entry.path.to_path(params.instance_dir.minecraft_dir());
-                        for file in files::get_files_ignore_paths(&dir_path, &seen_paths) {
+                        for file in files::get_files_ignore_paths(&dir_path, &seen_paths).await {
                             tasks.delete_tasks.push(DeleteTask { path: file.clone() });
                         }
                     }

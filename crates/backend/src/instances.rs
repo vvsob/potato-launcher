@@ -7,7 +7,7 @@ use instance::{
     localized::LocalizedString,
     manifest::InstanceManifest,
     mod_sync::{self, ModSyncSettings},
-    storage::{InstanceHandle, LocalInstance},
+    storage::{InstanceHandle, JvmGcOpts, LocalInstance},
 };
 use launcher_auth::{providers::AuthProviderConfig, storage::AccountKey};
 use launcher_bridge::{
@@ -38,7 +38,9 @@ pub struct LocalMetadataView {
     pub display_name: Option<LocalizedString>,
     pub auth_provider: Option<AuthProviderConfig>,
     pub default_xmx_mb: Option<u64>,
-    pub required_java_version: Option<Arc<str>>,
+    pub required_java_version: Option<String>,
+    pub minecraft_version: Option<String>,
+    pub loader: Option<String>,
     pub mod_sync: ModSyncSettings,
 }
 
@@ -75,7 +77,8 @@ pub struct InstanceUserSettingsView {
     pub selected_account: Option<AccountKey>,
     pub account_override: Option<AccountKey>,
     pub xmx_mb: Option<u64>,
-    pub jvm_flags: Option<Arc<str>>,
+    pub jvm_opts: Option<Arc<str>>,
+    pub jvm_gc_opts: JvmGcOpts,
     pub java_path: Option<Arc<str>>,
     pub use_native_glfw: Option<bool>,
     pub optional_mod_sets: std::collections::HashMap<String, bool>,
@@ -135,6 +138,8 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
             .unwrap_or_default();
         let mut orphaned = false;
         let mut manifest_auth_provider = None;
+        let mut manifest_java_version = None;
+        let mut manifest_versions = (None, None);
         let (display_name, origin) = match &local.source {
             Some(source) => {
                 let manifest = fetched_manifests.get(&source.manifest_url);
@@ -148,6 +153,9 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
                 match (manifest, remote) {
                     (Some(_), Some(remote)) => {
                         manifest_auth_provider = remote.auth_backend.clone();
+                        manifest_java_version = Some(remote.required_java_version.clone());
+                        manifest_versions =
+                            (remote.minecraft_version.clone(), remote.loader.clone());
                         covered_remote_keys.insert(remote_key(&source.manifest_url, &remote.id));
                         if local.is_installed()
                             && status == InstanceLiveStatus::Installed
@@ -210,6 +218,12 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
             ),
         };
 
+        // An installed instance shows what it actually runs.
+        let (minecraft_version, loader) = if metadata.minecraft_version.is_some() {
+            (metadata.minecraft_version.clone(), metadata.loader.clone())
+        } else {
+            manifest_versions
+        };
         let auth_provider = manifest_auth_provider.or(metadata.auth_provider);
         let has_required_account = auth_provider
             .as_ref()
@@ -245,9 +259,15 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
                 .map(|account| account.data.user_info.username.clone().into()),
             effective_auth_provider: effective_account.map(|account| account.provider.clone()),
             effective_xmx_mb: settings.xmx_mb.or(metadata.default_xmx_mb),
-            jvm_flags: settings.jvm_flags,
+            jvm_opts: settings.jvm_opts,
+            jvm_gc_opts: settings.jvm_gc_opts,
             java_path: settings.java_path,
-            required_java_version: metadata.required_java_version,
+            required_java_version: metadata
+                .required_java_version
+                .clone()
+                .or(manifest_java_version),
+            minecraft_version: minecraft_version.as_deref().map(Arc::from),
+            loader: loader.as_deref().map(Arc::from),
             use_native_glfw: settings.use_native_glfw,
             optional_mod_sets: build_optional_mod_set_views(
                 &metadata.mod_sync,
@@ -293,9 +313,12 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
             effective_account_username: None,
             effective_auth_provider: None,
             effective_xmx_mb: None,
-            jvm_flags: None,
+            jvm_opts: None,
+            jvm_gc_opts: JvmGcOpts::Default,
             java_path: None,
             required_java_version: None,
+            minecraft_version: None,
+            loader: None,
             use_native_glfw: None,
             optional_mod_sets: Arc::from([]),
             launch_after_install: launch_after,
@@ -357,9 +380,12 @@ pub fn build_instance_views(input: &InstanceViewBuildInput<'_>) -> Vec<InstanceV
                     .map(|account| account.provider.clone())
                     .or(entry.auth_backend.clone()),
                 effective_xmx_mb: settings.xmx_mb,
-                jvm_flags: settings.jvm_flags,
+                jvm_opts: settings.jvm_opts,
+                jvm_gc_opts: settings.jvm_gc_opts,
                 java_path: settings.java_path,
-                required_java_version: Some(Arc::from(entry.required_java_version.as_str())),
+                required_java_version: Some(entry.required_java_version.clone()),
+                minecraft_version: entry.minecraft_version.as_deref().map(Arc::from),
+                loader: entry.loader.as_deref().map(Arc::from),
                 use_native_glfw: settings.use_native_glfw,
                 optional_mod_sets: Arc::from([]),
                 launch_after_install: launch_after,
@@ -807,6 +833,8 @@ mod tests {
             sha1: "remote-sha1".to_string(),
             auth_backend: None,
             required_java_version: "8".to_string(),
+            minecraft_version: None,
+            loader: None,
         };
         let catalogs = HashMap::from([(
             url,
@@ -909,7 +937,7 @@ mod tests {
                 selected_account: Some(selected_key.clone()),
                 account_override: None,
                 xmx_mb: None,
-                jvm_flags: None,
+                jvm_opts: None,
                 ..Default::default()
             },
         )]);
@@ -946,6 +974,8 @@ mod tests {
             sha1: "remote-sha1".to_string(),
             auth_backend: Some(provider.clone()),
             required_java_version: "8".to_string(),
+            minecraft_version: None,
+            loader: None,
         };
         let catalogs = HashMap::from([(
             url,
@@ -981,6 +1011,8 @@ mod tests {
             sha1: "remote-sha1".to_string(),
             auth_backend: Some(required),
             required_java_version: "8".to_string(),
+            minecraft_version: None,
+            loader: None,
         };
         let handle = remote_entry_handle(&url, &entry.id);
         let catalogs = HashMap::from([(
@@ -995,7 +1027,7 @@ mod tests {
                 selected_account: None,
                 account_override: Some(override_key.clone()),
                 xmx_mb: None,
-                jvm_flags: None,
+                jvm_opts: None,
                 ..Default::default()
             },
         )]);
@@ -1036,7 +1068,7 @@ mod tests {
                 selected_account: None,
                 account_override: Some(override_account.clone()),
                 xmx_mb: Some(6144),
-                jvm_flags: Some(Arc::<str>::from("-Dexample=true")),
+                jvm_opts: Some(Arc::<str>::from("-Dexample=true")),
                 ..Default::default()
             },
         )]);
@@ -1053,7 +1085,7 @@ mod tests {
 
         assert_eq!(views[0].account_override, Some(override_account));
         assert_eq!(views[0].effective_xmx_mb, Some(6144));
-        assert_eq!(views[0].jvm_flags.as_deref(), Some("-Dexample=true"));
+        assert_eq!(views[0].jvm_opts.as_deref(), Some("-Dexample=true"));
         assert!(views[0].launch_blocked_reason.is_none());
     }
 
@@ -1142,6 +1174,8 @@ mod tests {
                     sha1: sha1.to_string(),
                     auth_backend: None,
                     required_java_version: "8".to_string(),
+                    minecraft_version: None,
+                    loader: None,
                 })
                 .collect(),
         }

@@ -45,8 +45,10 @@ fn main() {
         "LAUNCHER_NAME",
         "LAUNCHER_APP_ID",
         "LAUNCHER_ICON",
+        "LAUNCHER_DATA_DIR",
         "INSTANCE_MANIFEST_URLS",
-        "BACKEND_API_BASE",
+        "LAUNCHER_UPDATE_URL",
+        "LAUNCHER_UPDATE_GITHUB",
         "VERSION",
         "USE_NATIVE_GLFW_DEFAULT",
     ] {
@@ -58,7 +60,22 @@ fn main() {
     let launcher_app_id =
         get_env("LAUNCHER_APP_ID", &build_env).unwrap_or_else(|| LAUNCHER_APP_ID_DEFAULT.into());
     let launcher_icon = get_env("LAUNCHER_ICON", &build_env);
-    let backend_api_base = get_env("BACKEND_API_BASE", &build_env);
+    let data_dir = get_env("LAUNCHER_DATA_DIR", &build_env);
+    if let Some(dir) = &data_dir
+        && (dir.contains(['/', '\\']) || dir == "." || dir == "..")
+    {
+        panic!("LAUNCHER_DATA_DIR must be a single folder name");
+    }
+    let update_url = get_env("LAUNCHER_UPDATE_URL", &build_env);
+    let update_github = get_env("LAUNCHER_UPDATE_GITHUB", &build_env);
+    if update_url.is_some() && update_github.is_some() {
+        panic!("set only one of LAUNCHER_UPDATE_URL and LAUNCHER_UPDATE_GITHUB");
+    }
+    if let Some(repo) = &update_github
+        && repo.split('/').filter(|part| !part.is_empty()).count() != 2
+    {
+        panic!("LAUNCHER_UPDATE_GITHUB must be owner/repo");
+    }
     let version = get_env("VERSION", &build_env);
     let use_native_glfw_default = get_env("USE_NATIVE_GLFW_DEFAULT", &build_env)
         .unwrap_or_else(|| "false".into())
@@ -77,8 +94,10 @@ fn main() {
         r#"pub const LAUNCHER_NAME: &str = {launcher_name:?};
 pub const LAUNCHER_APP_ID: &str = {launcher_app_id:?};
 pub const LAUNCHER_ICON: Option<&str> = {launcher_icon:?};
+pub const LAUNCHER_DATA_DIR: Option<&str> = {data_dir:?};
 pub const INSTANCE_MANIFEST_URLS: &[&str] = &[{urls_literal}];
-pub const BACKEND_API_BASE: Option<&str> = {backend_api_base:?};
+pub const LAUNCHER_UPDATE_URL: Option<&str> = {update_url:?};
+pub const LAUNCHER_UPDATE_GITHUB: Option<&str> = {update_github:?};
 pub const VERSION: Option<&str> = {version:?};
 pub const USE_NATIVE_GLFW_DEFAULT: bool = {use_native_glfw_default};
 "#

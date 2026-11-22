@@ -135,6 +135,11 @@ pub struct InstanceManifestEntry {
     /// Required Java major version (e.g. "21"). Must always match
     /// `InstanceMetadata.get_java_version()` for the entry's metadata.
     pub required_java_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft_version: Option<String>,
+    /// Such as `NeoForge`; unset for vanilla.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader: Option<String>,
 }
 
 impl InstanceManifestEntry {

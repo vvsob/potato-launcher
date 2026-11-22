@@ -2,6 +2,10 @@
 
 Currently, the only supported deployment method is GitHub Actions, as it's the easiest way to build for all OSes.
 
+::: tip You don't have to build your own launcher
+Players can use the main Potato Launcher and add your instance list to it: click **Configure backends**, paste `https://<your-domain>/data/instance_manifest.json` under **Add Backend** and click **Add Backend**. The main page of your site shows this URL with a Copy button. This works as long as there were no breaking changes between your `potato` version and the main launcher's.
+:::
+
 Start by forking the https://github.com/Petr1Furious/potato_launcher repository.
 
 Then, you have two options to configure your launcher: config file or environment variables.
@@ -30,40 +34,62 @@ To use this option, go to the "Settings" tab, then choose "Secrets and variables
 
 ## Variables list
 
-- **LAUNCHER_NAME** (required): Your launcher name, for example "Potato Launcher". Can only contain Latin letters, numbers, spaces, `-`, `_` and `'`
-- **INSTANCE_MANIFEST_URLS** (optional): One or more instance manifest URLs for your deployed modpacks, separated by commas, semicolons, or newlines. For a typical server deployment, set this to `https://<your-domain>/data/instance_manifest.json`. The launcher uses these as default backend catalog URLs; users can add or remove catalogs later in launcher settings. Can be omitted if you want users to configure catalogs manually after install.
-- **LAUNCHER_APP_ID** (required): An application ID in a [reverse domain notation](https://en.wikipedia.org/wiki/Reverse_domain_name_notation). Used in macOS and Flatpak packages. For example, `me.petr1furious.PotatoLauncher`
+::: warning Change the app ID and name
+After forking, set your own **LAUNCHER_APP_ID** and **LAUNCHER_NAME**. macOS and Flatpak use the app ID to tell apps apart, so with the original ID your launcher and Potato Launcher will conflict on players' systems. The name sets the launcher's data folder by default, so with the original name both launchers share their instances and settings.
+:::
+
+- **LAUNCHER_NAME** (required): Your launcher name, for example "Potato Launcher". Can only contain Latin letters, numbers, spaces, `-`, `_` and `'`. Change it from the original, see the warning above
+- **INSTANCE_MANIFEST_URLS** (optional): One or more instance manifest URLs for your deployed modpacks, separated by commas, semicolons, or newlines. For a typical server deployment, set this to `https://<your-domain>/data/instance_manifest.json`. The launcher uses these as default catalog URLs; users can add or remove catalogs later in launcher settings. Can be omitted if you want users to configure catalogs manually after install.
+- **LAUNCHER_APP_ID** (required): An application ID in a [reverse domain notation](https://en.wikipedia.org/wiki/Reverse_domain_name_notation). Used in macOS and Flatpak packages. For example, `com.example.MyLauncher`. Use your own, see the warning above
 - **LAUNCHER_ICON** (required): A path to the launcher icon, relative to the repository root. For example, `packaging/potato_launcher.png`
 
   If you are using the environment variables option, this can also be a URL.
-- **BACKEND_API_BASE** (optional): An URL that will be used to download launcher updates. Doesn't impact instance download. Set it to `https://<your-domain>/api/v1` if you want the launcher to update automatically (you want to). Also used to generate the `.flatpakref` file
+- **LAUNCHER_DATA_DIR** (optional): The name of the folder in the user's data directory where the launcher keeps its data. Each launcher gets its own folder. Default: the launcher name in lowercase with dashes, for example `potato-launcher`
+
+  Users can also override the full path with the `POTATO_LAUNCHER_DATA_DIR` environment variable when running the launcher.
+- **LAUNCHER_UPDATE_URL** (optional): Where the launcher looks for its own updates on your host. Set it to `https://<your-domain>/launcher`. The launcher reads `<url>/<os>/version.txt` and downloads `<url>/<os>/<file>`.
+- **LAUNCHER_UPDATE_GITHUB** (optional): Update from GitHub Releases instead, as `owner/repo`. The launcher reads the latest release and uses its tag as the version.
+
+  Set at most one of the two, setting both fails the build. Without either, the launcher doesn't update itself. Variables from Actions only override `build.env` when they're non-empty, so if you set `LAUNCHER_UPDATE_GITHUB` there, also remove `LAUNCHER_UPDATE_URL` from `build.env`.
 - **LAUNCHER_DESCRIPTION** (optional): The application description. Used in `.desktop` files in the Nix and Flatpak packages, can safely be omitted.
 - **FLATPAK_KEYWORDS** (optional): Semicolon-separated list of additional keywords for the Flatpak `.desktop` file. Can safely be omitted.
 - **USE_NATIVE_GLFW_DEFAULT** (optional): If `true`, new instances default to using native GLFW. Default: `false`
 
-## Setting up secrets
+## Publishing releases
 
-If you want GitHub Actions to upload built launcher artifacts to your backend automatically, set these secrets.
+The launcher is built and released when you push a version tag:
 
-Go to the "Settings" tab, then choose "Secrets and variables" on the left and select "Actions". Then, add the secrets in the "Secrets" tab.
+```bash
+git tag v1.2.0
+git push --tags
+```
 
-You need to set the following secrets:
-- **ADMIN_SECRET_TOKEN**: Must match the `ADMIN_SECRET_TOKEN` used by your deployed backend (see [Server setup](/setting-up/server))
+The tag becomes the launcher's version. Use `vX.Y.Z` tags (pre-releases like `v1.2.0-rc1` work too): launchers only offer an update when the published version is newer than their own. Other versions update on any difference.
 
-If you want signed Flatpak packages on `master`, also set:
-- **GPG_PRIVATE_KEY**: Private key used to sign Flatpak bundles
-- **GPG_PASSPHRASE**: Passphrase for the key above, if any
+The **Release** job then creates a GitHub release with the launcher files and the `potato` binaries. If `LAUNCHER_PUBLISH_TARGET` is set, it also publishes the launcher to your host with `potato publish-launcher`, which updates the downloads page at the site root.
 
-And the corresponding variable:
-- **GPG_PUBLIC_KEY**: Public key matching the private key above
+To publish to your host, set these variables:
+
+- **LAUNCHER_PUBLISH_TARGET**: The site root (not `data/`), for example `rsync://user@host/srv/potato/site` or `s3://bucket/prefix`. See [publish targets](/setting-up/hosting#publish-targets).
+- **LAUNCHER_PUBLISH_KNOWN_HOSTS**: The host's SSH key lines for `known_hosts`, for `rsync://` targets.
+- **AWS_REGION**, **AWS_ENDPOINT**: For `s3://` targets.
+
+And these secrets:
+
+- **LAUNCHER_PUBLISH_SSH_KEY**: A private SSH key with write access to the site folder, for `rsync://` targets.
+- **AWS_ACCESS_KEY_ID**, **AWS_SECRET_ACCESS_KEY**: For `s3://` targets.
+- **GPG_PRIVATE_KEY**, **GPG_PASSPHRASE** (optional): Used to sign the Flatpak bundle.
+
+To add them, go to the "Settings" tab, then choose "Secrets and variables" on the left and select "Actions".
 
 ## Triggering the build
 
-All done! Make sure to enable actions in your fork by going to the "Actions" tab and clicking "I understand my workflows".
+Make sure to enable actions in your fork by going to the "Actions" tab and clicking "I understand my workflows".
 
-Then, you can trigger the build:
+Then, the build runs:
 
-- By pushing to the `master` branch. This runs the **Check** workflow first, and when it succeeds, the **Build launcher** workflow starts automatically. Uploads happen on `master` when `BACKEND_API_BASE` and `ADMIN_SECRET_TOKEN` are set.
-- Or manually via "Run workflow" on **Build launcher** (you can enable uploads in the workflow inputs)
+- On every push to `master`, keeping the builds as workflow artifacts
+- On every `v*` tag, which also makes a release
+- Manually via "Run workflow" on **Build launcher**, for any branch. This only keeps the builds as workflow artifacts, without a release.
 
-After a successful workflow run, the launcher binaries and packages should be available at `https://your.domain/launcher`
+After a release, the launcher is available at `https://<your-domain>/` and `https://<your-domain>/launcher/<os>/`.

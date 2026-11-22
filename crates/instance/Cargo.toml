@@ -1,6 +1,6 @@
 [package]
 name = "instance"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ url.workspace = true
 relative-path.workspace = true
 log.workspace = true
 uuid.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
-zip.workspace = true
+async_zip.workspace = true

@@ -26,8 +26,11 @@ modules:
         CARGO_HOME: /run/build/potato-launcher/cargo
         VERSION: {{ version }}
         LAUNCHER_NAME: {{ app_name }}
+        LAUNCHER_DATA_DIR: "{{ launcher_data_dir }}"
         INSTANCE_MANIFEST_URLS: {{ instance_manifest_urls }}
-        BACKEND_API_BASE: ""
+        # used only to check for new versions; Flatpak installs never self-update
+        LAUNCHER_UPDATE_URL: "{{ launcher_update_url }}"
+        LAUNCHER_UPDATE_GITHUB: "{{ launcher_update_github }}"
         # TODO: bundle patched GLFW and enable this
         # USE_NATIVE_GLFW_DEFAULT: "true"
     build-commands:

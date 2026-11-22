@@ -1,6 +1,6 @@
 [package]
 name = "generate"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]
@@ -18,4 +18,5 @@ relative-path.workspace = true
 log.workspace = true
 rand.workspace = true
 serde-xml-rs = "0.8.2"
+globset = "0.4.18"
 lazy_static.workspace = true

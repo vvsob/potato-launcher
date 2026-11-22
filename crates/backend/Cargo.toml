@@ -1,9 +1,10 @@
 [package]
 name = "launcher-backend"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 
 [dependencies]
+semver = "1"
 anyhow.workspace = true
 async-trait.workspace = true
 instance = { path = "../instance" }
@@ -24,13 +25,12 @@ launcher-i18n = { path = "../i18n" }
 generate = { path = "../generate" }
 utils = { path = "../utils" }
 sha1.workspace = true
-zip.workspace = true
 futures.workspace = true
 flate2.workspace = true
 tar.workspace = true
 either.workspace = true
-serde-saphyr = "0.0.28"
-toml_edit = "0.25.12"
+serde-saphyr = "2.0.0"
+toml_edit = "0.25.17"
 
 [dev-dependencies]
 tempfile = "3"
